@@ -231,3 +231,304 @@ pub fn simulate_loss<R: rand::Rng>(
     }
     received
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::SeedableRng;
+
+    fn test_params() -> Vec<(&'static str, ErasureParams)> {
+        vec![
+            ("agave_32_32", ErasureParams::agave_default()),
+            ("constellation_64", ErasureParams::constellation(64)),
+            ("constellation_128", ErasureParams::constellation(128)),
+            ("constellation_256", ErasureParams::constellation(256)),
+        ]
+    }
+
+    #[test]
+    fn erasure_params_calculations() {
+        let agave = ErasureParams::agave_default();
+        assert_eq!(agave.data_shards, 32);
+        assert_eq!(agave.parity_shards, 32);
+        assert_eq!(agave.total_shards(), 64);
+        assert_eq!(agave.max_loss(), 32);
+
+        let c256 = ErasureParams::constellation(256);
+        assert_eq!(c256.data_shards, 64);
+        assert_eq!(c256.parity_shards, 192);
+        assert_eq!(c256.total_shards(), 256);
+        assert_eq!(c256.max_loss(), 192);
+    }
+
+    #[test]
+    fn round_trip_no_loss() {
+        for (name, params) in test_params() {
+            for payload_size in [64, 1024, 8192, 65536] {
+                let encoder = Encoder::new(params);
+                let original = demo_pslice(payload_size);
+
+                let encoded = encoder.encode(&original).expect("encode failed");
+                assert_eq!(encoded.shreds.len(), params.total_shards());
+
+                let mut received: Vec<Option<Vec<u8>>> =
+                    encoded.shreds.into_iter().map(Some).collect();
+                let recovered = encoder
+                    .decode(&mut received, encoded.original_len)
+                    .expect("decode failed");
+
+                assert_eq!(
+                    recovered, original,
+                    "{name}: round-trip failed for payload size {payload_size}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn round_trip_max_loss() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(12345);
+
+        for (name, params) in test_params() {
+            for payload_size in [64, 1024, 8192] {
+                let encoder = Encoder::new(params);
+                let original = demo_pslice(payload_size);
+
+                let encoded = encoder.encode(&original).expect("encode failed");
+
+                let mut received = simulate_loss(encoded.shreds, params.max_loss(), &mut rng);
+
+                let surviving = received.iter().filter(|s| s.is_some()).count();
+                assert_eq!(
+                    surviving,
+                    params.data_shards,
+                    "should have exactly data_shards surviving"
+                );
+
+                let recovered = encoder
+                    .decode(&mut received, encoded.original_len)
+                    .expect("decode failed");
+
+                assert_eq!(
+                    recovered, original,
+                    "{name}: max-loss round-trip failed for payload size {payload_size}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn round_trip_partial_loss() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(67890);
+
+        for (name, params) in test_params() {
+            let encoder = Encoder::new(params);
+            let original = demo_pslice(4096);
+            let encoded = encoder.encode(&original).expect("encode failed");
+
+            for loss_fraction in [0.25, 0.5, 0.75] {
+                let drop_count = (params.parity_shards as f64 * loss_fraction) as usize;
+
+                let mut received = simulate_loss(encoded.shreds.clone(), drop_count, &mut rng);
+                let recovered = encoder
+                    .decode(&mut received, encoded.original_len)
+                    .expect("decode failed");
+
+                assert_eq!(
+                    recovered, original,
+                    "{name}: partial-loss ({loss_fraction}) round-trip failed"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn round_trip_many_random_patterns() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(11111);
+
+        let params = ErasureParams::constellation(256);
+        let encoder = Encoder::new(params);
+        let original = demo_pslice(8192);
+
+        for trial in 0..100 {
+            let encoded = encoder.encode(&original).expect("encode failed");
+            let mut received = simulate_loss(encoded.shreds, params.max_loss(), &mut rng);
+
+            let recovered = encoder
+                .decode(&mut received, encoded.original_len)
+                .unwrap_or_else(|e| panic!("trial {trial}: decode failed: {e}"));
+
+            assert_eq!(recovered, original, "trial {trial}: data mismatch");
+        }
+    }
+
+    #[test]
+    fn round_trip_small_payload() {
+        for (name, params) in test_params() {
+            let encoder = Encoder::new(params);
+
+            for payload_size in [1, 7, 15, 31] {
+                let original = demo_pslice(payload_size);
+                let encoded = encoder.encode(&original).expect("encode failed");
+
+                let mut received: Vec<Option<Vec<u8>>> =
+                    encoded.shreds.into_iter().map(Some).collect();
+                let recovered = encoder
+                    .decode(&mut received, encoded.original_len)
+                    .expect("decode failed");
+
+                assert_eq!(
+                    recovered, original,
+                    "{name}: small payload {payload_size} failed"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn round_trip_only_data_shards_survive() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(22222);
+
+        for (name, params) in test_params() {
+            let encoder = Encoder::new(params);
+            let original = demo_pslice(2048);
+            let encoded = encoder.encode(&original).expect("encode failed");
+
+            let mut received: Vec<Option<Vec<u8>>> =
+                encoded.shreds.into_iter().map(Some).collect();
+
+            use rand::seq::SliceRandom;
+            let mut parity_indices: Vec<usize> =
+                (params.data_shards..params.total_shards()).collect();
+            parity_indices.shuffle(&mut rng);
+
+            for &i in &parity_indices {
+                received[i] = None;
+            }
+
+            let surviving = received.iter().filter(|s| s.is_some()).count();
+            assert_eq!(surviving, params.data_shards);
+
+            let recovered = encoder
+                .decode(&mut received, encoded.original_len)
+                .expect("decode failed");
+
+            assert_eq!(
+                recovered, original,
+                "{name}: only-data-shards recovery failed"
+            );
+        }
+    }
+
+    #[test]
+    fn round_trip_only_parity_shards_survive() {
+        let mut rng = rand::rngs::StdRng::seed_from_u64(33333);
+
+        for (name, params) in test_params() {
+            if params.parity_shards < params.data_shards {
+                continue;
+            }
+
+            let encoder = Encoder::new(params);
+            let original = demo_pslice(2048);
+            let encoded = encoder.encode(&original).expect("encode failed");
+
+            let mut received: Vec<Option<Vec<u8>>> =
+                encoded.shreds.into_iter().map(Some).collect();
+
+            for i in 0..params.data_shards {
+                received[i] = None;
+            }
+
+            use rand::seq::SliceRandom;
+            let mut parity_indices: Vec<usize> =
+                (params.data_shards..params.total_shards()).collect();
+            parity_indices.shuffle(&mut rng);
+
+            let excess_parity = params.parity_shards - params.data_shards;
+            for &i in parity_indices.iter().take(excess_parity) {
+                received[i] = None;
+            }
+
+            let surviving = received.iter().filter(|s| s.is_some()).count();
+            assert_eq!(surviving, params.data_shards);
+
+            let recovered = encoder
+                .decode(&mut received, encoded.original_len)
+                .expect("decode failed");
+
+            assert_eq!(
+                recovered, original,
+                "{name}: only-parity-shards recovery failed"
+            );
+        }
+    }
+
+    #[test]
+    fn wire_frame_round_trip() {
+        let params = ErasureParams::constellation(256);
+        let encoder = Encoder::new(params);
+        let original = demo_pslice(1024);
+        let encoded = encoder.encode(&original).expect("encode failed");
+
+        for (index, shard) in encoded.shreds.iter().enumerate() {
+            let framed = frame_pshred(params, index, encoded.original_len, shard);
+            let parsed = parse_pshred(&framed).expect("parse failed");
+
+            assert_eq!(parsed.params, params);
+            assert_eq!(parsed.index, index);
+            assert_eq!(parsed.original_len, encoded.original_len);
+            assert_eq!(&parsed.shard, shard);
+        }
+    }
+
+    #[test]
+    fn wire_frame_reassembly() {
+        let params = ErasureParams::constellation(64);
+        let encoder = Encoder::new(params);
+        let original = demo_pslice(512);
+        let encoded = encoder.encode(&original).expect("encode failed");
+
+        let frames: Vec<Vec<u8>> = encoded
+            .shreds
+            .iter()
+            .enumerate()
+            .map(|(i, shard)| frame_pshred(params, i, encoded.original_len, shard))
+            .collect();
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(44444);
+        use rand::seq::SliceRandom;
+        let mut indices: Vec<usize> = (0..frames.len()).collect();
+        indices.shuffle(&mut rng);
+
+        let drop_count = params.max_loss();
+        let surviving_indices: Vec<usize> = indices.into_iter().skip(drop_count).collect();
+
+        let mut received: Vec<Option<Vec<u8>>> = vec![None; params.total_shards()];
+        let mut original_len = 0;
+
+        for &i in &surviving_indices {
+            let parsed = parse_pshred(&frames[i]).expect("parse failed");
+            original_len = parsed.original_len;
+            received[parsed.index] = Some(parsed.shard);
+        }
+
+        let recovered = encoder
+            .decode(&mut received, original_len)
+            .expect("decode failed");
+
+        assert_eq!(recovered, original);
+    }
+
+    #[test]
+    fn reed_solomon_cache_reuse() {
+        let cache = ReedSolomonCache::new();
+
+        let params = ErasureParams::constellation(256);
+
+        let rs1 = cache.get(params).expect("first get failed");
+        let rs2 = cache.get(params).expect("second get failed");
+
+        assert!(Arc::ptr_eq(&rs1, &rs2), "cache should return same instance");
+    }
+}
