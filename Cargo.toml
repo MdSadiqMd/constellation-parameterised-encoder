@@ -1,6 +1,20 @@
 [package]
 name = "constellation-parameterised-encoder"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
+reed-solomon-erasure = { version = "6.0", features = ["simd-accel"] }
+rand = "0.8"
+thiserror = "2.0"
+lru = "0.12"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "erasure"
+harness = false
+
+[profile.release]
+debug = true
